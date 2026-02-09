@@ -3,99 +3,111 @@ import pandas as pd
 from datetime import datetime
 import io
 
+def smart_read(file, skiprows=0):
+    """Intenta leer el archivo como Excel, si falla como CSV, y si falla como HTML."""
+    # 1. Intentar como Excel real
+    try:
+        return pd.read_excel(file, skiprows=skiprows)
+    except:
+        pass
+    
+    # 2. Intentar como CSV (Muy común en BBVA aunque diga .xlsx)
+    try:
+        file.seek(0)
+        return pd.read_csv(file, skiprows=skiprows, sep=None, engine='python')
+    except:
+        pass
+
+    # 3. Intentar como HTML (Común en Inversis/Santander .xls antiguos)
+    try:
+        file.seek(0)
+        tables = pd.read_html(file)
+        if tables:
+            df = tables[0]
+            if skiprows > 0:
+                df = df.iloc[skiprows:].reset_index(drop=True)
+            return df
+    except:
+        pass
+    
+    raise ValueError("No se ha podido determinar el formato del archivo. ¿Seguro que es un extracto bancario?")
+
 def create_ofx(df, col_fecha, col_concepto, col_importe):
-    """Genera el contenido OFX estándar."""
     ofx_header = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <?OFX OFXHEADER="200" VERSION="211" SECURITY="NONE" OLDFILEUID="NONE" NEWFILEUID="NONE"?>
 <OFX>
     <BANKMSGSRSV1><STMTTRNRS><STMTRS>
         <CURDEF>EUR</CURDEF>
         <BANKTRANLIST>"""
-    
     ofx_footer = """</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>"""
 
     transactions = ""
     for _, row in df.iterrows():
         try:
-            # Procesar fecha
-            fecha_val = row[col_fecha]
-            if isinstance(fecha_val, str):
-                dt = pd.to_datetime(fecha_val, dayfirst=True)
-            else:
-                dt = fecha_val
+            # Limpiar fecha
+            f_val = row[col_fecha]
+            dt = pd.to_datetime(f_val, dayfirst=True) if isinstance(f_val, str) else f_val
+            if pd.isna(dt): continue
             date_str = dt.strftime('%Y%m%d')
             
-            # Procesar importe
-            amount = row[col_importe]
-            if isinstance(amount, str):
-                # Limpiar formatos como 1.250,50
-                amount = float(amount.replace('.', '').replace(',', '.'))
+            # Limpiar importe
+            amt = row[col_importe]
+            if isinstance(amt, str):
+                amt = float(amt.replace('.', '').replace(',', '.'))
+            if pd.isna(amt): continue
             
             memo = str(row[col_concepto])
-            # Generar ID único para evitar duplicados en apps de finanzas
-            fitid = f"{date_str}{str(amount).replace('.','')}{memo[:3]}".replace(" ", "")
+            fitid = f"{date_str}{str(abs(amt)).replace('.','')}{memo[:3]}".replace(" ", "")
             
             transactions += f"""
                 <STMTTRN>
-                    <TRNTYPE>{'CREDIT' if amount > 0 else 'DEBIT'}</TRNTYPE>
+                    <TRNTYPE>{'CREDIT' if amt > 0 else 'DEBIT'}</TRNTYPE>
                     <DTPOSTED>{date_str}</DTPOSTED>
-                    <TRNAMT>{amount}</TRNAMT>
+                    <TRNAMT>{amt}</TRNAMT>
                     <FITID>{fitid}</FITID>
                     <MEMO>{memo}</MEMO>
                 </STMTTRN>"""
-        except:
-            continue
-    
+        except: continue
     return ofx_header + transactions + ofx_footer
 
-# --- Configuración de la App ---
-st.set_page_config(page_title="Convertidor Bancario", page_icon="📈")
-st.title("🏦 Convertidor de Extractos a OFX")
-st.markdown("Convierte tus archivos de **BBVA, Santander o Inversis** para usarlos en aplicaciones de finanzas.")
+# --- Interfaz ---
+st.set_page_config(page_title="Convertidor Bancario PRO", page_icon="🏦")
+st.title("🏦 Convertidor Bancario Inteligente")
+st.write("Soporta archivos de BBVA, Santander e Inversis (incluso si la extensión es engañosa).")
 
 banco = st.selectbox("Selecciona tu banco:", ["BBVA", "Santander", "Inversis"])
-# Inversis suele ser .xls, BBVA/Santander suelen ser .xlsx
-uploaded_file = st.file_uploader("Sube el archivo descargado de tu banco", type=["xlsx", "xls"])
+uploaded_file = st.file_uploader("Sube tu archivo", type=["xlsx", "xls", "csv"])
 
 if uploaded_file:
     try:
+        # Configuración por banco
         if banco == "BBVA":
-            # Ajustado según el archivo real que subiste (salta 4 filas, limpia vacíos)
-            df = pd.read_excel(uploaded_file, skiprows=4)
-            df = df.dropna(axis=1, how='all') # Elimina columnas vacías iniciales
+            df = smart_read(uploaded_file, skiprows=4)
+            # BBVA suele tener una col 0 vacía en sus CSVs
+            df = df.dropna(axis=1, how='all')
             c_fecha, c_concepto, c_importe = 'Fecha', 'Concepto', 'Importe'
         
         elif banco == "Santander":
-            df = pd.read_excel(uploaded_file, skiprows=7)
+            df = smart_read(uploaded_file, skiprows=7)
             c_fecha, c_concepto, c_importe = 'Fecha Valor', 'Concepto', 'Importe'
             
         elif banco == "Inversis":
-            # Inversis .xls: suele tener cabeceras simples
-            df = pd.read_excel(uploaded_file) 
-            # Intentamos detectar columnas si no son fijas
-            df.columns = df.columns.str.strip()
+            df = smart_read(uploaded_file, skiprows=0)
+            df.columns = df.columns.astype(str).str.strip()
+            # Búsqueda automática de columnas para Inversis
             c_fecha = next((c for c in df.columns if 'fecha' in c.lower()), df.columns[0])
             c_concepto = next((c for c in df.columns if 'desc' in c.lower() or 'concep' in c.lower()), df.columns[1])
-            c_importe = next((c for c in df.columns if 'importe' in c.lower() or 'valor' in c.lower()), df.columns[2])
+            c_importe = next((c for c in df.columns if 'importe' in c.lower()), df.columns[2])
 
-        # Limpiar espacios en nombres de columnas
+        # Limpieza final
         df.columns = df.columns.str.strip()
-        # Eliminar filas donde la fecha sea nula (finales de página, etc)
-        df = df.dropna(subset=[c_fecha])
+        df = df.dropna(subset=[c_fecha, c_importe])
 
-        st.success(f"Archivo de {banco} cargado con éxito.")
-        st.write("### Vista previa de movimientos:")
+        st.success("¡Archivo analizado con éxito!")
         st.dataframe(df[[c_fecha, c_concepto, c_importe]].head())
 
-        # Botón de descarga
         ofx_data = create_ofx(df, c_fecha, c_concepto, c_importe)
-        st.download_button(
-            label="💾 Descargar archivo .OFX",
-            data=ofx_data,
-            file_name=f"movimientos_{banco.lower()}.ofx",
-            mime="application/x-ofx"
-        )
-        
+        st.download_button("💾 Descargar .OFX", ofx_data, f"{banco.lower()}.ofx")
+
     except Exception as e:
-        st.error(f"Error al procesar el archivo: {e}")
-        st.info("Nota: Si es un .xls de Inversis, asegúrate de tener instalada la librería 'xlrd'.")
+        st.error(f"Error: {e}")
