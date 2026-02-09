@@ -1,92 +1,90 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import xml.etree.ElementTree as ET
 import io
 
 def create_ofx(df, col_fecha, col_concepto, col_importe):
-    """Genera el contenido OFX."""
     ofx_header = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <?OFX OFXHEADER="200" VERSION="211" SECURITY="NONE" OLDFILEUID="NONE" NEWFILEUID="NONE"?>
 <OFX>
     <BANKMSGSRSV1><STMTTRNRS><STMTRS>
         <CURDEF>EUR</CURDEF>
         <BANKTRANLIST>"""
-    
     ofx_footer = """</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>"""
 
     transactions = ""
     for _, row in df.iterrows():
         try:
             # Procesar fecha
-            fecha_obj = row[col_fecha]
-            if isinstance(fecha_obj, str):
-                fecha_obj = pd.to_datetime(fecha_obj, dayfirst=True)
-            date_str = fecha_obj.strftime('%Y%m%d')
+            f = row[col_fecha]
+            dt = pd.to_datetime(f, dayfirst=True) if isinstance(f, str) else f
+            date_str = dt.strftime('%Y%m%d')
             
-            # Procesar importe
-            amount = row[col_importe]
-            if isinstance(amount, str):
-                amount = float(amount.replace('.', '').replace(',', '.'))
+            # Importe
+            amt = row[col_importe]
+            if isinstance(amt, str):
+                amt = float(amt.replace('.', '').replace(',', '.'))
             
             memo = str(row[col_concepto])
-            fitid = f"{date_str}{amount}{memo[:5]}"
+            fitid = f"{date_str}{str(amt).replace('.','')}{memo[:3]}".replace(" ", "")
             
             transactions += f"""
                 <STMTTRN>
-                    <TRNTYPE>{'CREDIT' if amount > 0 else 'DEBIT'}</TRNTYPE>
+                    <TRNTYPE>{'CREDIT' if amt > 0 else 'DEBIT'}</TRNTYPE>
                     <DTPOSTED>{date_str}</DTPOSTED>
-                    <TRNAMT>{amount}</TRNAMT>
+                    <TRNAMT>{amt}</TRNAMT>
                     <FITID>{fitid}</FITID>
                     <MEMO>{memo}</MEMO>
                 </STMTTRN>"""
-        except:
-            continue
-    
+        except: continue
     return ofx_header + transactions + ofx_footer
 
-# --- Interfaz ---
-st.set_page_config(page_title="Convertidor Bancario", page_icon="💰")
-st.title("🏦 Convertidor Universal a OFX")
+st.title("🏦 Conversor Universal a OFX")
 
-banco = st.selectbox("Selecciona el formato de origen", ["BBVA", "Santander", "Inversis"])
-uploaded_file = st.file_uploader("Sube tu archivo Excel o CSV", type=["xlsx", "csv"])
+banco = st.radio("Origen de datos:", ["BBVA", "Santander", "Inversis (XML)"], horizontal=True)
+
+# Ajustar tipos de archivo permitidos
+file_types = ["xlsx"] if banco != "Inversis (XML)" else ["xml"]
+uploaded_file = st.file_uploader(f"Sube tu archivo de {banco}", type=file_types)
 
 if uploaded_file:
     try:
-        # Lógica de lectura según el banco
         if banco == "BBVA":
-            # Según tu muestra, BBVA tiene 4 filas vacías/título y la col 0 está vacía
-            df = pd.read_excel(uploaded_file, skiprows=4)
-            # Si el archivo tiene una columna vacía al principio, la eliminamos
-            df = df.dropna(axis=1, how='all') 
+            df = pd.read_excel(uploaded_file, skiprows=4).dropna(axis=1, how='all')
             c_fecha, c_concepto, c_importe = 'Fecha', 'Concepto', 'Importe'
         
         elif banco == "Santander":
             df = pd.read_excel(uploaded_file, skiprows=7)
             c_fecha, c_concepto, c_importe = 'Fecha Valor', 'Concepto', 'Importe'
             
-        elif banco == "Inversis":
-            # Inversis suele usar 'Fecha Operación' y 'Descripción'
-            df = pd.read_excel(uploaded_file, skiprows=3) # Ajustar según tu Excel real
-            c_fecha = 'Fecha Operación' if 'Fecha Operación' in df.columns else 'Fecha'
-            c_concepto = 'Descripción' if 'Descripción' in df.columns else 'Concepto'
-            c_importe = 'Importe'
+        elif banco == "Inversis (XML)":
+            # --- Lógica específica para XML de Inversis ---
+            tree = ET.parse(uploaded_file)
+            root = tree.getroot()
+            
+            data = []
+            # Inversis suele estructurar por <movimiento> o similar
+            # Buscamos de forma genérica etiquetas que suelen contener los datos
+            for mov in root.iter():
+                if 'movimiento' in mov.tag.lower() or 'item' in mov.tag.lower():
+                    row = {}
+                    for child in mov:
+                        row[child.tag] = child.text
+                    if row: data.append(row)
+            
+            df = pd.DataFrame(data)
+            # Mapeo de columnas típicas de su XML
+            c_fecha = next((c for c in df.columns if 'fecha' in c.lower()), None)
+            c_concepto = next((c for c in df.columns if 'descripcion' in c.lower() or 'concepto' in c.lower()), None)
+            c_importe = next((c for c in df.columns if 'importe' in c.lower()), None)
 
-        # Limpieza de datos
         df.columns = df.columns.str.strip()
-        df = df.dropna(subset=[c_fecha, c_importe])
-        
-        st.write("### Vista previa de los datos detectados:")
+        st.write("### Previsualización:")
         st.dataframe(df[[c_fecha, c_concepto, c_importe]].head())
 
-        # Botón de descarga
-        ofx_output = create_ofx(df, c_fecha, c_concepto, c_importe)
-        st.download_button(
-            label=f"Descargar OFX para {banco}",
-            data=ofx_output,
-            file_name=f"export_{banco.lower()}.ofx",
-            mime="application/x-ofx"
-        )
-        
+        ofx_result = create_ofx(df, c_fecha, c_concepto, c_importe)
+        st.download_button("💾 Descargar OFX", ofx_result, f"banco_{banco}.ofx")
+
     except Exception as e:
-        st.error(f"Error al procesar: {e}. Revisa que las columnas coincidan.")
+        st.error(f"Error: {e}")
